@@ -1,91 +1,95 @@
-import ortools 
-from ortools.constraint_solver import routing_enums_pb2
-from ortools.constraint_solver import pywrapcp
-import numpy as np
+import geopandas as gpd
+import matplotlib.pyplot as plt
 import pandas as pd
+import requests
+import numpy as np
 from pathlib import Path
 
-def main():
-    Demand = pd.read_csv("data/Demand_List.csv")
-    Dist_Matrix = pd.read_csv("data/Dist_Matrix.csv")
+DATA_DIR = Path(__file__).parent / "project_files"
+OSRM_URL = "http://localhost:5001"
 
-    Demand_Matrix = Demand["Demand"].tolist() 
-    Distance_Matrix = Dist_Matrix["Distance"].tolist() 
+clients = gpd.read_file(DATA_DIR / "Clients_CET587_2021.shp")
+streets = gpd.read_file(DATA_DIR / "Seattle_Streets.shp")
 
-    data = create_data_model(Distance_Matrix, Demand_Matrix)
-    manager = pywrapcp.RoutingIndexManager(len(data["distance_matrix"]), data["num_vehicles"], data["depot"])
-    routing = pywrapcp.RoutingModel(manager)
+clients = clients.set_crs(epsg=2926, allow_override=True).to_crs(epsg=4326)
+streets = streets.to_crs(epsg=4326)
 
-    transit_callback_index = routing.RegisterTransitCallback(distance_callback)
+depot = clients[clients["Route"] == 0]
+clients = clients[clients["Route"] != 0]
 
-    demand_callback_index = routing.RegisterUnaryTransitCallback(demand_callback)
-    routing.AddDimensionWithVehicleCapacity(
-        demand_callback_index,
-        0,  # null capacity slack
-        data["vehicle_capacities"],  # vehicle maximum capacities
-        True,  # start cumul to zero
-        "Capacity",
-    )
+fig, ax = plt.subplots(figsize=(10, 10))
+streets.plot(ax=ax, color="lightgray", linewidth=0.5, label="Streets")
+clients.plot(ax=ax, color="red", markersize=10, label="Clients")
+depot.plot(ax=ax, color="green", markersize=15, marker="*", label="Depot")
+ax.legend()
+ax.set_title("VRP Data Layers")
+plt.tight_layout()
+plt.show()
 
-    #Assigning an arc cost to the distance between each subset of points.
-    routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
+# Build distance matrix via OSRM /table endpoint
+# Combine depot + clients so depot is index 0
+all_locations = gpd.GeoDataFrame(
+    pd.concat([depot, clients], ignore_index=True), crs=clients.crs
+)
+coords = ";".join(
+    f"{row.geometry.x},{row.geometry.y}" for _, row in all_locations.iterrows()
+)
+response = requests.get(f"{OSRM_URL}/table/v1/driving/{coords}?annotations=distance")
+response.raise_for_status()
 
-    #Create objective function to minimize total distance / distances along each route (arc costs)
-    search_parameters = pywrapcp.DefaultRoutingSearchParameters()
-    search_parameters.first_solution_strategy = (
-        routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-    )
+distance_matrix = np.array(response.json()["distances"])
+print(f"Distance matrix shape: {distance_matrix.shape}")
+print(f"Sample distance (loc 0 → loc 1): {distance_matrix[0][1]:.1f} meters")
 
-    print_solution(data, manager, routing, solution)
+# --- OR-Tools VRP Solver ---
+from ortools.constraint_solver import routing_enums_pb2, pywrapcp
+
+NUM_VEHICLES = 6
+VEHICLE_CAPACITY = 200
+DEPOT_INDEX = 0
+
+# number of is in cases of coffee (case = 12 1lb bags with a total of 1.5 cubic feet)
+demands = [int(row["Number_of"]) for _, row in all_locations.iterrows()]
+demands[0] = 0  # depot has no demand
+
+dist_matrix_int = distance_matrix.astype(int).tolist()
+
+manager = pywrapcp.RoutingIndexManager(len(dist_matrix_int), NUM_VEHICLES, DEPOT_INDEX)
+routing = pywrapcp.RoutingModel(manager)
 
 def distance_callback(from_index, to_index):
-    """Returns the distance between the two nodes."""
-    from_node = manager.IndexToNode(from_index)
-    to_node = manager.IndexToNode(to_index)
-    return data["distance_matrix"][from_node][to_node]
+    return dist_matrix_int[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)]
+
+transit_idx = routing.RegisterTransitCallback(distance_callback)
+routing.SetArcCostEvaluatorOfAllVehicles(transit_idx)
 
 def demand_callback(from_index):
-    """Returns the demand of the node."""
-    # Convert from routing variable Index to demands NodeIndex.
-    from_node = manager.IndexToNode(from_index)
-    return data["demands"][from_node]
+    return demands[manager.IndexToNode(from_index)]
 
-def create_data_model(Distance_Matrix, Demand_Matrix):
-    data = {}
-    data["distance_matrix"] = Distance_Matrix
-    data["demands"] = Demand_Matrix
-    data["vehicle_capacities"] = [] # todo
-    data["num_vehicles"] = 0 # todo
-    data["depot"] = 1
-    return data
+demand_idx = routing.RegisterUnaryTransitCallback(demand_callback)
+routing.AddDimensionWithVehicleCapacity(
+    demand_idx, 0, [VEHICLE_CAPACITY] * NUM_VEHICLES, True, "Capacity"
+)
 
-def print_solution(data, manager, routing, solution):
-    """Prints solution on console."""
-    print(f"Objective: {solution.ObjectiveValue()}")
-    total_distance = 0
-    total_load = 0
-    for vehicle_id in range(data["num_vehicles"]):
-        index = routing.Start(vehicle_id)
-        plan_output = f"Route for vehicle {vehicle_id}:\n"
-        route_distance = 0
-        route_load = 0
+search_params = pywrapcp.DefaultRoutingSearchParameters()
+search_params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+search_params.time_limit.seconds = 30
+
+print("Solving VRP...")
+solution = routing.SolveWithParameters(search_params)
+
+if solution:
+    print(f"Objective (total distance): {solution.ObjectiveValue()} meters")
+    for v in range(NUM_VEHICLES):
+        index = routing.Start(v)
+        stops, load, dist = [], 0, 0
         while not routing.IsEnd(index):
-            node_index = manager.IndexToNode(index)
-            route_load += data["demands"][node_index]
-            plan_output += f" {node_index} Load({route_load}) -> "
-            previous_index = index
+            node = manager.IndexToNode(index)
+            stops.append(node)
+            load += demands[node]
+            prev = index
             index = solution.Value(routing.NextVar(index))
-            route_distance += routing.GetArcCostForVehicle(
-                previous_index, index, vehicle_id
-            )
-        plan_output += f" {manager.IndexToNode(index)} Load({route_load})\n"
-        plan_output += f"Distance of the route: {route_distance}mi\n"
-        plan_output += f"Load of the route: {route_load}\n"
-        print(plan_output)
-        total_distance += route_distance
-        total_load += route_load
-    print(f"Total distance of all routes: {total_distance}mi")
-    print(f"Total load of all routes: {total_load}")
-
-if __name__ == "__main__":
-    main()
+            dist += routing.GetArcCostForVehicle(prev, index, v)
+        print(f"Vehicle {v}: {len(stops)-1} stops, load={load}, distance={dist}m")
+else:
+    print("No solution found.")
