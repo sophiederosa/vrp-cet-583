@@ -1,0 +1,5 @@
+.venv/
+osrm-data/
+
+# Generated outputs
+project_files/vrp_geopandas_routes.csv
